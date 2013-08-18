@@ -1,0 +1,212 @@
+#!/usr/bin/perl
+
+# xs-snapshot-tree - Citrix XenServer Snapshot Tree Analyzer
+#
+# Authors:
+#   Thomas Liske <thomas@fiasko-nw.net>
+#
+# Copyright Holder:
+#   2013 (C) Thomas Liske [http://fiasko-nw.net/~thomas/]
+#
+# License:
+#   This program is free software; you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation; either version 2 of the License, or
+#   (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this package; if not, write to the Free Software
+#   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
+#
+
+use warnings;
+use strict;
+use Data::Dumper;
+
+sub format_size($) {
+    my $v = shift;
+    my %prefs = (
+	1099511627776 => 'Ti',
+	1073741824 => 'Gi',
+	1048576 => 'Mi',
+	1024 => 'Ki',
+    );
+
+    my $unit = 'B';
+    my $div = 1;
+    foreach my $f (sort {$b <=> $a} keys %prefs) {
+	if($v > $f) {
+	    $unit = "$prefs{$f}$unit";
+	    $div = $f;
+	    last;
+	}
+    }
+
+    return sprintf("%.2f$unit", $v/$div);
+}
+
+sub add_vhd($$$) {
+    my ($tree, $uuid, $parent) = @_;
+
+    unless(defined($parent)) {
+	$tree->{$uuid} = {
+	    childs => {},
+	};
+	return 1;
+    }
+
+    foreach my $child (keys %$tree) {
+	if($child eq $parent) {
+	    $tree->{$child}->{childs}->{$uuid} = {
+		childs => {},
+	    } unless(exists($tree->{$child}->{childs}->{$uuid}));
+	    return 1;
+	}
+
+	return 1 if(&add_vhd($tree->{$child}->{childs}, $uuid, $parent));
+    }
+
+    return 0;
+}
+
+sub print_out($$$) {
+    my ($meta, $tree, $ident) = (@_);
+
+    foreach my $uuid (sort keys %$tree) {
+	print $ident, (keys %{ $tree->{$uuid}->{childs} } ? '+ ' : '- '), "[$uuid]\n";
+	foreach my $k (sort keys %{ $meta->{$uuid} }) {
+	    printf "$ident    %20s => %s\n", $k, ($k =~ /size/ ? format_size($meta->{$uuid}->{$k}) : $meta->{$uuid}->{$k});
+	}
+	&print_out($meta, $tree->{$uuid}->{childs}, "  $ident") if(keys %{ $tree->{$uuid}->{childs} });
+    }
+}
+
+
+# Get VM-VDI mappings...
+print "Scanning VDIs...\n";
+open(HXE, 'xe vbd-list |') || exit(1);
+my %vdilist;
+my($vdiuuid, $vmname);
+while(<HXE>) {
+    chomp;
+
+    if(/vdi-uuid [^:]+: (\S+)/) {
+	$vdiuuid = $1;
+    }
+    elsif(/vm-name-label [^:]+: (.+)$/) {
+	$vdilist{$vdiuuid} = $vmname if(defined($vmname));
+	$vmname = $1;
+    }
+}
+$vdilist{$vdiuuid} = $vmname if(defined($vmname));
+close(HXE);
+
+
+# Select SRs...
+print "Scanning SRs...\n";
+my %srlist;
+my ($sruuid, $srname);
+open(HXE, 'xe sr-list type=lvmohba |') || exit(1);
+while(<HXE>) {
+    chomp;
+
+    if(/^uuid [^:]+: (\S+)/) {
+	$srlist{$sruuid} = $srname if(defined($srname));
+	$sruuid = $1;
+    }
+    elsif(/name-label [^:]+: (.+)$/) {
+	$srname = $1;
+    }
+}
+$srlist{$sruuid} = $srname if(defined($srname));
+
+print "\nStorage Repositories:\n\n 0: *\n";
+my @srlist;
+foreach my $uuid (sort {$srlist{$a} cmp $srlist{$b}} keys %srlist) {
+    push(@srlist, $uuid);
+    printf(" %d: %s\n", $#srlist+1, $srlist{$uuid});
+}
+
+my $srid;
+do {
+    print "\nSelect SR to analyze [0]: ";
+    $srid = <>;
+    chomp($srid);
+    $srid =~ s/^$/0/;
+} while($srid =~ /\D/ || int($srid) > $#srlist+1);
+
+
+# Process SRs...
+foreach $sruuid (($srid == 0 ? @srlist : $srlist[$srid - 1])) {
+    print "\n\nAnalysing SR '$srlist{$sruuid}'...\n", '=' x 74, "\n";
+
+    my %list;
+    my %meta;
+    my %sum;
+    open(HVHD, "vhd-util scan -f -m \"VHD-*\" -l \"VG_XenStorage-$sruuid\" |") || exit(2);
+    while(<HVHD>) {
+	chomp;
+
+	unless(/vhd=VHD-(\S+) capacity=(\d+) size=(\d+) hidden=(\d) parent=(none|VHD-(\S+))/) {
+	    warn "Garbage line: '$_'!\n";
+	    next;
+	}
+
+	my ($uuid, $parent) = ($1, $6);
+	my ($svirt, $sphys) = ($2, $3);
+	my %m = (
+	    'size-virtual' => $svirt,
+	    'size-physical' => $sphys,
+	    'vhd is hidden' => ($4 ? 'True' : 'False'),
+	);
+
+	$sum{virtual} += $svirt;
+	$sum{physical} += $sphys;
+
+	$sum{'hidden-virtual'} += $svirt if($4);
+	$sum{'hidden-physical'} += $sphys if($4);
+
+	$list{$uuid} = $parent;
+	$meta{$uuid} = \%m;
+    }
+
+    my %tree;
+
+    foreach my $i (0..30) {
+	foreach my $uuid (keys %list) {
+	    delete($list{$uuid}) if(add_vhd(\%tree, $uuid, $list{$uuid}));
+	}
+
+	last unless(keys %list);
+    }
+
+    if(keys %list) {
+	warn "Oops, not all VHD have been resolved:\n\n".Dumper(\%list)."\n";
+    }
+
+    foreach my $uuid (keys %meta) {
+	open(HXE, "xe vdi-param-list uuid=$uuid |") || warn "Could not run xe: $!\n";
+	while(<HXE>) {
+	    chomp;
+	    if(/([\w-]+) \(...\): (.+)/) {
+		my ($k, $v) = ($1, $2);
+		$meta{$uuid}->{$k} = $v if($k =~ /(is-a-snapshot|snapshot-of|name-label|name-description)/ && $k ne 'sr-name-label' && $v ne '');
+	    }
+	}
+	close(HXE);
+
+	$meta{$uuid}->{'vm-name-label'} = "$vdilist{$uuid}" if(exists($vdilist{$uuid}));
+    }
+
+    print_out(\%meta, \%tree, '');
+
+    print "\nTotal for SR '$srlist{$sruuid}':\n";
+    foreach my $k (sort keys %sum) {
+	printf "  %15s => %s\n", $k, format_size($sum{$k});
+    }
+}

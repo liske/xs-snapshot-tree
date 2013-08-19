@@ -82,4 +82,4 @@ Example:
 
 This example shows a single VM (named *w2008r2.local*) which has one valid
 snapshot (named *w2008r2-before-upgrade*) and a bunch of hidden uncoalesced
-old snapshots occupying 135&nbsp;GiB.
+old snapshots occupying 135&nbsp;GiB of disk space.
